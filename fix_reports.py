@@ -17,16 +17,17 @@ def fix_missing_extensions():
 
                 # Bereinigen
                 safe = file.replace(":", "_").replace("/", "_").replace("\\", "_")
-                new_path = os.path.join(root, safe + ".html")
+                new_path = os.path.join(root, safe + ".txt")
 
                 os.rename(old_path, new_path)
                 print(f"Fix: {old_path}  →  {new_path}")
                 fixed += 1
 
             # Hat die Datei eine falsche Endung?
-            elif not file.lower().endswith(".html"):
+            elif not file.lower().endswith(".txt"):
                 old_path = os.path.join(root, file)
-                new_path = os.path.join(root, file + ".html")
+                base_name, _ext = os.path.splitext(file)
+                new_path = os.path.join(root, base_name + ".txt")
                 os.rename(old_path, new_path)
                 print(f"Fix: {old_path}  →  {new_path}")
                 fixed += 1

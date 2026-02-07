@@ -1,4 +1,8 @@
+import json
 import os
+import time
+from urllib.parse import urlparse
+
 import requests
 from utils.normalize import normalize_url
 from utils.user_agents import MAG_USER_AGENTS, BROWSER_USER_AGENTS
@@ -30,14 +34,19 @@ def ensure_input_dir():
 
 REPORT_MODE = "details"  # "single", "details", "both"
 
+DEFAULT_TIMEOUT = 10
+REQUEST_RETRIES = 3
+REQUEST_BACKOFF = 1.5
+CHANNEL_CHECK_MAX_BYTES = 512 * 1024
+
 def save_html(mode: str, portal_name: str, content: str):
     ensure_output_dirs()
     safe_name = f"{portal_name}_{mode}".replace(":", "_").replace("/", "_").replace("\\", "_")
-    filename = safe_name + ".html"
+    filename = safe_name + ".txt"
     path = os.path.join("ausgabe", mode, filename)
 
     if not content or content.strip() == "":
-        content = "<!-- EMPTY HTML: Portal lieferte keinen Inhalt -->"
+        content = "EMPTY: Portal lieferte keinen Inhalt"
 
     with open(path, "w", encoding="utf-8") as f:
         f.write(content)
@@ -45,14 +54,278 @@ def save_html(mode: str, portal_name: str, content: str):
 
 def save_combined(portal_name: str, sections: dict[str, str]):
     ensure_output_dirs()
-    html_parts = ["<html><body><h1>Portal Report</h1>"]
+    lines = ["Portal Report"]
     for title, body in sections.items():
-        html_parts.append(f"<h2>{title}</h2><pre>{body}</pre>")
-    html_parts.append("</body></html>")
-    content = "\n".join(html_parts)
-    path = os.path.join("ausgabe", "combined", f"{portal_name}_full.html")
+        lines.append("")
+        lines.append(f"[{title}]")
+        lines.append(body)
+    content = "\n".join(lines)
+    path = os.path.join("ausgabe", "combined", f"{portal_name}_full.txt")
     with open(path, "w", encoding="utf-8") as f:
         f.write(content)
+
+
+def _base_url(url: str) -> str:
+    parsed = urlparse(url if "://" in url else f"http://{url}")
+    base = f"{parsed.scheme}://{parsed.netloc}"
+    return base.rstrip("/")
+
+
+def _host_from_url(url: str) -> str:
+    parsed = urlparse(url if "://" in url else f"http://{url}")
+    return parsed.netloc
+
+
+def safe_get(url: str,
+             headers: dict | None = None,
+             proxies: dict | None = None,
+             timeout: int = DEFAULT_TIMEOUT,
+             stream: bool = False,
+             cookies: dict | None = None) -> tuple[requests.Response | None, str]:
+    last_err = ""
+    for attempt in range(REQUEST_RETRIES):
+        try:
+            r = requests.get(
+                url,
+                headers=headers,
+                proxies=proxies,
+                timeout=timeout,
+                allow_redirects=True,
+                stream=stream,
+                cookies=cookies,
+            )
+            return r, ""
+        except Exception as e:
+            last_err = str(e)
+            time.sleep(REQUEST_BACKOFF * (attempt + 1))
+    return None, last_err
+
+
+def build_proxy_dict(proxy_cfg: dict | None) -> dict | None:
+    if not proxy_cfg:
+        return None
+    server = proxy_cfg.get("server", "")
+    user = proxy_cfg.get("username")
+    pwd = proxy_cfg.get("password")
+    if user and pwd and "://" in server:
+        parsed = urlparse(server)
+        if parsed.hostname and parsed.port:
+            netloc = f"{user}:{pwd}@{parsed.hostname}:{parsed.port}"
+            server = f"{parsed.scheme}://{netloc}"
+    return {"http": server, "https": server}
+
+
+def load_credentials(path: str = "eingabe/credentials.txt") -> list[dict]:
+    ensure_input_dir()
+    if not os.path.exists(path):
+        return []
+    entries = []
+    with open(path, "r", encoding="utf-8") as f:
+        for line in f:
+            line = line.strip()
+            if not line or line.startswith("#"):
+                continue
+            parts = [p.strip() for p in line.split("|")]
+            if len(parts) == 4:
+                kind, url, user, password = parts
+                if kind.lower() == "xtream":
+                    entries.append({"kind": "xtream", "url": url, "user": user, "password": password})
+            elif len(parts) == 3:
+                kind = parts[0].lower()
+                if kind == "stalker":
+                    _, url, mac = parts
+                    entries.append({"kind": "stalker", "url": url, "mac": mac})
+                elif kind == "xtream":
+                    _, url, user = parts
+                    entries.append({"kind": "xtream", "url": url, "user": user, "password": ""})
+                else:
+                    url, user, password = parts
+                    entries.append({"kind": "xtream", "url": url, "user": user, "password": password})
+            elif len(parts) == 2:
+                url, mac = parts
+                entries.append({"kind": "stalker", "url": url, "mac": mac})
+    return entries
+
+
+def _match_credentials(creds: list[dict], url: str, kind: str | None = None) -> list[dict]:
+    host = _host_from_url(url)
+    matches = []
+    for c in creds:
+        if kind and c.get("kind") != kind:
+            continue
+        if _host_from_url(c.get("url", "")) == host:
+            matches.append(c)
+    return matches
+
+
+def _peek_stream_text(url: str, headers: dict, proxies: dict | None) -> tuple[str, str]:
+    r, err = safe_get(url, headers=headers, proxies=proxies, timeout=DEFAULT_TIMEOUT, stream=True)
+    if not r:
+        return "", err
+    chunks = []
+    total = 0
+    try:
+        for chunk in r.iter_content(chunk_size=8192):
+            if not chunk:
+                continue
+            chunks.append(chunk)
+            total += len(chunk)
+            if total >= CHANNEL_CHECK_MAX_BYTES:
+                break
+    finally:
+        r.close()
+    try:
+        return b"".join(chunks).decode("utf-8", errors="ignore"), ""
+    except Exception as e:
+        return "", str(e)
+
+
+def probe_xtream(base_url: str, creds: list[dict], proxies: dict | None) -> dict:
+    info = {"detected": False, "channels_ok": None, "details": []}
+    headers = build_headers(BROWSER_USER_AGENTS[0])
+
+    endpoints = [
+        f"{base_url}/player_api.php",
+        f"{base_url}/get.php",
+        f"{base_url}/xmltv.php",
+    ]
+
+    for ep in endpoints:
+        r, err = safe_get(ep, headers=headers, proxies=proxies, timeout=DEFAULT_TIMEOUT)
+        if not r:
+            info["details"].append(f"XTREAM endpoint {ep} error: {err}")
+            continue
+        text = r.text or ""
+        status = r.status_code
+        lower = text.lower()
+        if status in (200, 401, 403) and (
+            "user_info" in lower or
+            "server_info" in lower or
+            "xtream" in lower or
+            "#extm3u" in lower or
+            "<tv" in lower
+        ):
+            info["detected"] = True
+        info["details"].append(f"XTREAM endpoint {ep} status: {status}")
+
+    cred_list = _match_credentials(creds, base_url, kind="xtream")
+    if cred_list:
+        c = cred_list[0]
+        auth_url = f"{base_url}/player_api.php?username={c['user']}&password={c['password']}"
+        r, err = safe_get(auth_url, headers=headers, proxies=proxies, timeout=DEFAULT_TIMEOUT)
+        if r and r.text:
+            try:
+                payload = json.loads(r.text)
+                if isinstance(payload, dict) and payload.get("user_info"):
+                    info["detected"] = True
+                    auth = payload.get("user_info", {}).get("auth")
+                    info["details"].append(f"XTREAM auth: {auth}")
+            except Exception:
+                info["details"].append("XTREAM auth: invalid JSON")
+        else:
+            info["details"].append(f"XTREAM auth error: {err}")
+
+        channels_url = (
+            f"{base_url}/player_api.php?username={c['user']}&password={c['password']}&action=get_live_streams"
+        )
+        text, err = _peek_stream_text(channels_url, headers, proxies)
+        if text:
+            if "\"stream_id\"" in text or "\"name\"" in text:
+                info["channels_ok"] = True
+            else:
+                info["channels_ok"] = False
+        else:
+            info["details"].append(f"XTREAM channel check error: {err}")
+
+    else:
+        info["details"].append("XTREAM creds: none")
+
+    return info
+
+
+def probe_stalker(base_url: str, creds: list[dict], proxies: dict | None) -> dict:
+    info = {"detected": False, "channels_ok": None, "details": []}
+    headers = build_headers(MAG_USER_AGENTS[0])
+    headers["X-User-Agent"] = "Model: MAG254; Link: Ethernet"
+    headers["Referer"] = f"{base_url}/c/"
+
+    endpoints = [
+        f"{base_url}/portal.php",
+        f"{base_url}/stalker_portal/portal.php",
+    ]
+
+    for ep in endpoints:
+        r, err = safe_get(ep, headers=headers, proxies=proxies, timeout=DEFAULT_TIMEOUT)
+        if not r:
+            info["details"].append(f"STALKER endpoint {ep} error: {err}")
+            continue
+        text = r.text or ""
+        status = r.status_code
+        lower = text.lower()
+        if status in (200, 401, 403) and (
+            "stalker" in lower or
+            "ministra" in lower or
+            "portal.php" in lower
+        ):
+            info["detected"] = True
+        info["details"].append(f"STALKER endpoint {ep} status: {status}")
+
+    cred_list = _match_credentials(creds, base_url, kind="stalker")
+    if cred_list:
+        mac = cred_list[0].get("mac", "")
+        cookies = {"mac": mac, "stb_lang": "en", "timezone": "UTC"}
+        handshake_url = f"{base_url}/portal.php?type=stb&action=handshake"
+        r, err = safe_get(handshake_url, headers=headers, proxies=proxies, cookies=cookies)
+        token = ""
+        if r and r.text:
+            try:
+                payload = json.loads(r.text)
+                token = payload.get("js", {}).get("token", "") if isinstance(payload, dict) else ""
+                if token:
+                    info["detected"] = True
+                    info["details"].append("STALKER handshake: ok")
+            except Exception:
+                info["details"].append("STALKER handshake: invalid JSON")
+        else:
+            info["details"].append(f"STALKER handshake error: {err}")
+
+        if token:
+            auth_headers = dict(headers)
+            auth_headers["Authorization"] = f"Bearer {token}"
+            channels_url = f"{base_url}/portal.php?type=itv&action=get_all_channels"
+            text, err = _peek_stream_text(channels_url, auth_headers, proxies)
+            if text:
+                if "\"id\"" in text or "\"name\"" in text:
+                    info["channels_ok"] = True
+                else:
+                    info["channels_ok"] = False
+            else:
+                info["details"].append(f"STALKER channel check error: {err}")
+
+    else:
+        info["details"].append("STALKER creds: none")
+
+    return info
+
+
+def portal_info_check(url: str, proxies: dict | None) -> dict:
+    creds = load_credentials()
+    base_url = _base_url(url)
+    xtream = probe_xtream(base_url, creds, proxies)
+    stalker = probe_stalker(base_url, creds, proxies)
+
+    summary_lines = [f"Base URL: {base_url}"]
+    summary_lines.append(f"XTREAM detected: {xtream['detected']}")
+    summary_lines.append(f"XTREAM channels ok: {xtream['channels_ok']}")
+    summary_lines.append(f"STALKER detected: {stalker['detected']}")
+    summary_lines.append(f"STALKER channels ok: {stalker['channels_ok']}")
+
+    details = xtream["details"] + stalker["details"]
+    if details:
+        summary_lines.append("")
+        summary_lines.extend(details)
+
+    return {"summary": "\n".join(summary_lines)}
 
 
 # ============================================================
@@ -71,7 +344,7 @@ def classify_portal(result: dict) -> str:
         return "Cloudflare"
     return "Unklar"
 
-def requests_check(url: str, ua: str) -> dict:
+def requests_check(url: str, ua: str, proxies: dict | None = None) -> dict:
     res = {
         "status": "",
         "html": "",
@@ -81,7 +354,10 @@ def requests_check(url: str, ua: str) -> dict:
     }
     try:
         headers = build_headers(ua)
-        r = requests.get(url, headers=headers, timeout=10, allow_redirects=True)
+        r, err = safe_get(url, headers=headers, proxies=proxies, timeout=DEFAULT_TIMEOUT)
+        if not r:
+            res["error"] = err
+            return res
         res["status"] = r.status_code
         res["html"] = r.text
         res["headers"] = dict(r.headers)
@@ -145,9 +421,15 @@ def auto_scan_schnell(urls: list[str]):
                 if not proxy_cfg:
                     continue
                 try:
-                    r = requests.get(url, headers=build_headers(BROWSER_USER_AGENTS[0]),
-                                     proxies={"http": proxy_cfg["server"], "https": proxy_cfg["server"]},
-                                     timeout=10)
+                    proxy_dict = build_proxy_dict(proxy_cfg)
+                    r, err = safe_get(
+                        url,
+                        headers=build_headers(BROWSER_USER_AGENTS[0]),
+                        proxies=proxy_dict,
+                        timeout=DEFAULT_TIMEOUT,
+                    )
+                    if not r:
+                        raise Exception(err)
                     res = {
                         "status": r.status_code,
                         "html": r.text,
@@ -183,6 +465,8 @@ def auto_scan_schnell(urls: list[str]):
                     break
 
         print(f"Ergebnis: {final_class}")
+        portal_info = portal_info_check(url, None)
+        combined_sections["Portal-Info"] = portal_info["summary"]
         save_combined(portal_name, combined_sections)
 
 
@@ -220,9 +504,15 @@ def auto_scan_voll(urls: list[str]):
         proxy_cfg = choose_proxy(proxies)
         if proxy_cfg:
             try:
-                r = requests.get(url, headers=build_headers(BROWSER_USER_AGENTS[0]),
-                                 proxies={"http": proxy_cfg["server"], "https": proxy_cfg["server"]},
-                                 timeout=10)
+                proxy_dict = build_proxy_dict(proxy_cfg)
+                r, err = safe_get(
+                    url,
+                    headers=build_headers(BROWSER_USER_AGENTS[0]),
+                    proxies=proxy_dict,
+                    timeout=DEFAULT_TIMEOUT,
+                )
+                if not r:
+                    raise Exception(err)
                 r4 = {
                     "status": r.status_code,
                     "html": r.text,
@@ -245,6 +535,8 @@ def auto_scan_voll(urls: list[str]):
         combined_sections["Session-Clone"] = f"Final URL: {r6['final_url']}\nError: {r6['error']}"
         save_html("session", portal_name, r6["html"])
 
+        portal_info = portal_info_check(url, None)
+        combined_sections["Portal-Info"] = portal_info["summary"]
         save_combined(portal_name, combined_sections)
 
 
@@ -427,9 +719,9 @@ def report_einstellungen():
     global REPORT_MODE
     print("""
 === REPORT-EINSTELLUNGEN ===
-1) Nur Gesamt-Report (HTML)
-2) Nur Detail-Reports (pro Modus)
-3) Gesamt-Report + Detail-Reports
+1) Nur Gesamt-Report (TXT)
+2) Nur Detail-Reports (pro Modus, TXT)
+3) Gesamt-Report + Detail-Reports (TXT)
 4) Zurück
 """)
     choice = input("> ").strip()
